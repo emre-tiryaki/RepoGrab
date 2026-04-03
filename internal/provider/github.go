@@ -3,14 +3,15 @@ package provider
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/emre-tiryaki/repograb/internal/models"
 )
 
-//Provider for downloading repositories from github
+// Provider for downloading repositories from github
 type GithubProvider struct {
-	Token string	//access token for github
+	Token string //access token for github
 }
 
 func (g *GithubProvider) FetchTree(owner, repo, branch, path string) ([]models.FileNode, error) {
@@ -36,5 +37,24 @@ func (g *GithubProvider) FetchTree(owner, repo, branch, path string) ([]models.F
 }
 
 func (g *GithubProvider) DownloadFile(url string) ([]byte, error) {
-	return nil, nil
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("Request couldnt created %w", err)
+	}
+
+	if g.Token != "" {
+		req.Header.Set("Authorization", "token "+g.Token)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("File couldnt downloaded %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return  nil, fmt.Errorf("Server didnt return 200(OK): %s", resp.Status)
+	}
+
+	return io.ReadAll(resp.Body)
 }

@@ -10,7 +10,7 @@ import (
 func main(){
 	p := &provider.GithubProvider{Token: ""}
 
-	items, err := p.FetchTree("torwalds", "linux", "main", "")
+	items, err := p.FetchTree("torvalds", "linux", "master", "")
 	if err != nil {
 		log.Fatal(err)
 	}

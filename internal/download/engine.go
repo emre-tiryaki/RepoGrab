@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/emre-tiryaki/repograb/internal/models"
 	"github.com/emre-tiryaki/repograb/internal/provider"
@@ -14,13 +15,29 @@ type DownloadEngine struct {
 	Provider    provider.GitProvider
 	BaseDir     string
 	MaxParallel int
+	OnProgress  func(ProgressUpdate)
+}
+
+type ProgressUpdate struct {
+	Completed int
+	Total     int
+	Path      string
+	Err       error
 }
 
 func (e *DownloadEngine) DownloadItems(items []models.FileNode) error {
 	var wg sync.WaitGroup
+	var completedCount int32
 
 	sem := make(chan struct{}, e.MaxParallel)
 	errChan := make(chan error, len(items))
+
+	totalFiles := 0
+	for _, item := range items {
+		if item.Type != "dir" {
+			totalFiles++
+		}
+	}
 
 	for _, item := range items {
 		if item.Type == "dir" {
@@ -37,6 +54,15 @@ func (e *DownloadEngine) DownloadItems(items []models.FileNode) error {
 			}()
 
 			err := e.DownloadSingleFile(node)
+			completed := int(atomic.AddInt32(&completedCount, 1))
+			if e.OnProgress != nil {
+				e.OnProgress(ProgressUpdate{
+					Completed: completed,
+					Total:     totalFiles,
+					Path:      node.Path,
+					Err:       err,
+				})
+			}
 			if err != nil {
 				errChan <- fmt.Errorf("Error when downloading %s: %w", node.Path, err)
 			}

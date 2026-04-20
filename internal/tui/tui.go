@@ -12,7 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/emre-tiryaki/repograb/internal/download"
+	"github.com/emre-tiryaki/repograb/internal/app"
 	"github.com/emre-tiryaki/repograb/internal/models"
 	"github.com/emre-tiryaki/repograb/internal/provider"
 )
@@ -51,26 +51,34 @@ type downloadErrMsg struct {
 	err error
 }
 
+type downloadProgressMsg struct {
+	update app.ProgressUpdate
+}
+
+type downloadProgressDoneMsg struct{}
+
 type MainModel struct {
-	state            sessionState
-	urlInput         textinput.Model
-	tokenInput       textinput.Model
-	downloadDirInput textinput.Model
-	tokenProvider    string
-	pendingSpec      provider.RepositorySpec
-	hasPendingSpec   bool
-	activeSpec       provider.RepositorySpec
-	hasActiveSpec    bool
-	browser          BrowserModel
-	tokens           map[string]string
-	downloadDir      string
-	configPath       string
-	err              error
-	info             string
-	loadingText      string
-	theme            Theme
-	width            int
-	height           int
+	state              sessionState
+	urlInput           textinput.Model
+	tokenInput         textinput.Model
+	downloadDirInput   textinput.Model
+	tokenProvider      string
+	pendingSpec        provider.RepositorySpec
+	hasPendingSpec     bool
+	activeSpec         provider.RepositorySpec
+	hasActiveSpec      bool
+	browser            BrowserModel
+	service            app.Service
+	downloadProgressCh chan app.ProgressUpdate
+	tokens             map[string]string
+	downloadDir        string
+	configPath         string
+	err                error
+	info               string
+	loadingText        string
+	theme              Theme
+	width              int
+	height             int
 }
 
 func (m MainModel) View() string {
@@ -131,7 +139,7 @@ func (m MainModel) View() string {
 			Align(lipgloss.Center, lipgloss.Center).
 			Render(loadingText)
 	case stateBrowser:
-		body := m.browser.View()
+		body := "Path: " + m.currentBrowserPath() + "\n\n" + m.browser.View()
 		if m.err != nil {
 			body += "\n" + lipgloss.NewStyle().Foreground(m.theme.ErrorColor).Render(m.err.Error())
 		}
@@ -165,7 +173,7 @@ func (m MainModel) renderFooter() string {
 	case stateLoading:
 		controls = "[q] Çıkış "
 	case stateBrowser:
-		controls = "[Space] Seç • [d] İndir • [b] Geri • [q] Çıkış "
+		controls = "[Enter] Aç • [Space] Seç • [d] İndir • [b] Geri • [q] Çıkış "
 	}
 
 	return style.Render(controls)
@@ -202,6 +210,7 @@ func NewModel() MainModel {
 		urlInput:         urlInput,
 		tokenInput:       tokenInput,
 		downloadDirInput: downloadDirInput,
+		service:          app.Service{},
 		theme:            DefaultTheme(),
 		tokens:           tokens,
 		downloadDir:      downloadDir,
@@ -235,14 +244,27 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case downloadCompletedMsg:
 		m.state = stateBrowser
 		m.err = nil
+		m.downloadProgressCh = nil
 		m.info = fmt.Sprintf("Downloaded %d file(s) to %s", msg.count, msg.targetDir)
 		m.loadingText = "Repository is downloading...\n\nPlease wait."
 		return m, nil
 	case downloadErrMsg:
 		m.state = stateBrowser
+		m.downloadProgressCh = nil
 		m.info = ""
 		m.err = msg.err
 		m.loadingText = "Repository is downloading...\n\nPlease wait."
+		return m, nil
+	case downloadProgressMsg:
+		m.loadingText = fmt.Sprintf("Selected files are downloading...\n\nProgress: %d/%d\nLast: %s", msg.update.Completed, msg.update.Total, msg.update.Path)
+		if msg.update.Err != nil {
+			m.loadingText += " (error)"
+		}
+		if m.downloadProgressCh != nil {
+			return m, waitDownloadProgressCmd(m.downloadProgressCh)
+		}
+		return m, nil
+	case downloadProgressDoneMsg:
 		return m, nil
 	case repositoryLoadErrMsg:
 		m.err = msg.err
@@ -277,7 +299,7 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 
-				selectedProvider, spec, err := m.detectProvider(rawURL)
+				selectedProvider, spec, err := m.service.DetectProvider(rawURL, m.tokens)
 				if err != nil {
 					m.err = err
 					m.info = ""
@@ -300,7 +322,7 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.tokenInput.SetValue(token)
 
 				if m.hasPendingSpec && m.pendingSpec.Provider == m.tokenProvider {
-					selectedProvider := m.providerForSpec(m.pendingSpec)
+					selectedProvider := m.service.ProviderForSpec(m.pendingSpec, m.tokens)
 					if selectedProvider == nil {
 						m.state = stateInput
 						m.err = errors.New("unsupported provider")
@@ -330,6 +352,35 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.info = "download folder updated"
 				m.urlInput.Focus()
 				return m, nil
+			case stateBrowser:
+				if len(m.browser.Items) == 0 || m.browser.Cursor < 0 || m.browser.Cursor >= len(m.browser.Items) {
+					return m, nil
+				}
+
+				selectedNode := m.browser.Items[m.browser.Cursor]
+				if selectedNode.Type != "dir" {
+					return m, nil
+				}
+
+				if !m.hasActiveSpec {
+					m.err = errors.New("active repository is not set")
+					return m, nil
+				}
+
+				nextSpec := m.activeSpec
+				nextSpec.Path = selectedNode.Path
+
+				selectedProvider := m.service.ProviderForSpec(nextSpec, m.tokens)
+				if selectedProvider == nil {
+					m.err = errors.New("unsupported provider")
+					return m, nil
+				}
+
+				m.state = stateLoading
+				m.err = nil
+				m.info = ""
+				m.loadingText = "Opening folder...\n\nPlease wait."
+				return m, m.fetchRepositoryCmd(selectedProvider, nextSpec)
 			}
 		case "tab":
 			if m.state == stateToken {
@@ -392,15 +443,33 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "b":
 			if m.state == stateBrowser {
-				m.state = stateInput
+				if !m.hasActiveSpec || m.activeSpec.Path == "" {
+					m.state = stateInput
+					m.info = ""
+					m.urlInput.Focus()
+					return m, nil
+				}
+
+				parentSpec := m.activeSpec
+				parentSpec.Path = parentPath(parentSpec.Path)
+
+				selectedProvider := m.service.ProviderForSpec(parentSpec, m.tokens)
+				if selectedProvider == nil {
+					m.err = errors.New("unsupported provider")
+					return m, nil
+				}
+
+				m.state = stateLoading
+				m.err = nil
 				m.info = ""
-				m.urlInput.Focus()
+				m.loadingText = "Opening parent folder...\n\nPlease wait."
+				return m, m.fetchRepositoryCmd(selectedProvider, parentSpec)
 			}
 		case "d":
 			if m.state == stateBrowser {
 				selectedItems := m.selectedDownloadItems()
 				if len(selectedItems) == 0 {
-					m.err = errors.New("select at least one file to download")
+					m.err = errors.New("select at least one file or folder to download")
 					m.info = ""
 					return m, nil
 				}
@@ -411,18 +480,23 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 
-				activeProvider := m.providerForSpec(m.activeSpec)
+				activeProvider := m.service.ProviderForSpec(m.activeSpec, m.tokens)
 				if activeProvider == nil {
 					m.err = errors.New("unsupported provider")
 					m.info = ""
 					return m, nil
 				}
 
+				progressCh := make(chan app.ProgressUpdate, 16)
+				m.downloadProgressCh = progressCh
 				m.state = stateLoading
 				m.err = nil
 				m.info = ""
 				m.loadingText = "Selected files are downloading...\n\nPlease wait."
-				return m, m.downloadSelectedCmd(activeProvider, m.activeSpec, selectedItems)
+				return m, tea.Batch(
+					m.downloadSelectedCmd(activeProvider, m.activeSpec, selectedItems, progressCh),
+					waitDownloadProgressCmd(progressCh),
+				)
 			}
 		}
 	}
@@ -440,34 +514,8 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m MainModel) providerForSpec(spec provider.RepositorySpec) provider.GitProvider {
-	token := m.tokens[spec.Provider]
-
-	switch spec.Provider {
-	case provider.ProviderGitLab:
-		return &provider.GitLabProvider{Token: token}
-	default:
-		return &provider.GithubProvider{Token: token}
-	}
-}
-
 func (m MainModel) detectProvider(rawURL string) (provider.GitProvider, *provider.RepositorySpec, error) {
-	providers := []provider.GitProvider{
-		&provider.GithubProvider{Token: m.tokens[provider.ProviderGitHub]},
-		&provider.GitLabProvider{Token: m.tokens[provider.ProviderGitLab]},
-	}
-
-	for _, selectedProvider := range providers {
-		spec, err := selectedProvider.ParseRepositoryURL(rawURL)
-		if err == nil {
-			if spec.DefaultBranch == "" {
-				spec.DefaultBranch = "main"
-			}
-			return selectedProvider, spec, nil
-		}
-	}
-
-	return nil, nil, provider.ErrInvalidRepositoryURL
+	return m.service.DetectProvider(rawURL, m.tokens)
 }
 
 func (m MainModel) providerNameFromCurrentURL() string {
@@ -481,17 +529,12 @@ func (m MainModel) providerNameFromCurrentURL() string {
 
 func (m MainModel) fetchRepositoryCmd(gitProvider provider.GitProvider, spec provider.RepositorySpec) tea.Cmd {
 	return func() tea.Msg {
-		resolvedSpec := spec
-		if err := gitProvider.ResolveRepository(&resolvedSpec); err != nil {
-			return repositoryLoadErrMsg{spec: resolvedSpec, err: err}
-		}
-
-		items, err := gitProvider.FetchTree(&resolvedSpec)
+		result, err := m.service.ResolveAndFetch(gitProvider, spec)
 		if err != nil {
-			return repositoryLoadErrMsg{spec: resolvedSpec, err: err}
+			return repositoryLoadErrMsg{spec: spec, err: err}
 		}
 
-		return repositoryLoadedMsg{spec: resolvedSpec, items: items}
+		return repositoryLoadedMsg{spec: result.Spec, items: result.Items}
 	}
 }
 
@@ -513,37 +556,42 @@ func (m MainModel) selectedDownloadItems() []models.FileNode {
 		}
 
 		node := m.browser.Items[index]
-		if node.Type == "dir" {
-			continue
-		}
-
 		items = append(items, node)
 	}
 
 	return items
 }
 
-func (m MainModel) downloadSelectedCmd(gitProvider provider.GitProvider, spec provider.RepositorySpec, items []models.FileNode) tea.Cmd {
+func waitDownloadProgressCmd(ch <-chan app.ProgressUpdate) tea.Cmd {
 	return func() tea.Msg {
-		repoDirName := strings.ReplaceAll(spec.ProjectPath, "/", "_")
+		update, ok := <-ch
+		if !ok {
+			return downloadProgressDoneMsg{}
+		}
+
+		return downloadProgressMsg{update: update}
+	}
+}
+
+func (m MainModel) downloadSelectedCmd(gitProvider provider.GitProvider, spec provider.RepositorySpec, items []models.FileNode, progressCh chan app.ProgressUpdate) tea.Cmd {
+	return func() tea.Msg {
 		targetBaseDir := m.downloadDir
 		if targetBaseDir == "" {
 			targetBaseDir = defaultDownloadDir()
 		}
 
-		targetDir := filepath.Join(targetBaseDir, repoDirName)
-
-		engine := &download.DownloadEngine{
-			Provider:    gitProvider,
-			BaseDir:     targetDir,
-			MaxParallel: 5,
-		}
-
-		if err := engine.DownloadItems(items); err != nil {
+		targetDir, count, err := m.service.DownloadSelected(gitProvider, spec, targetBaseDir, items, func(update app.ProgressUpdate) {
+			select {
+			case progressCh <- update:
+			default:
+			}
+		})
+		close(progressCh)
+		if err != nil {
 			return downloadErrMsg{err: err}
 		}
 
-		return downloadCompletedMsg{targetDir: targetDir, count: len(items)}
+		return downloadCompletedMsg{targetDir: targetDir, count: count}
 	}
 }
 
@@ -698,4 +746,26 @@ func tokenHelpText(name string) string {
 	default:
 		return "Create a Personal Access Token in GitHub: Settings > Developer settings > Personal access tokens. Grant repo read access for private repositories."
 	}
+}
+
+func (m MainModel) currentBrowserPath() string {
+	if !m.hasActiveSpec || strings.TrimSpace(m.activeSpec.Path) == "" {
+		return "/"
+	}
+
+	return "/" + strings.TrimPrefix(strings.TrimSpace(m.activeSpec.Path), "/")
+}
+
+func parentPath(path string) string {
+	trimmed := strings.Trim(strings.TrimSpace(path), "/")
+	if trimmed == "" {
+		return ""
+	}
+
+	parts := strings.Split(trimmed, "/")
+	if len(parts) <= 1 {
+		return ""
+	}
+
+	return strings.Join(parts[:len(parts)-1], "/")
 }
